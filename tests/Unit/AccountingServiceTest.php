@@ -1,0 +1,144 @@
+<?php
+
+use App\Models\Account;
+use App\Support\ChartAccountCodes;
+use App\Models\Team;
+use App\Models\User;
+use App\Services\AccountingService;
+use Database\Seeders\ChartOfAccountsSeeder;
+use Illuminate\Foundation\Testing\RefreshDatabase;
+
+uses(RefreshDatabase::class);
+
+beforeEach(function () {
+    $this->user = User::factory()->merchant()->create();
+    $this->team = Team::create(['name' => 'Test Team', 'slug' => 'test-team']);
+    $this->team->members()->attach($this->user, ['role' => 'owner']);
+    (new ChartOfAccountsSeeder)->run($this->team);
+    $this->actingAs($this->user);
+    $this->service = app(AccountingService::class);
+});
+
+it('posts a balanced journal entry', function () {
+    $entry = $this->service->post(
+        $this->team,
+        [
+            ['account_code' => ChartAccountCodes::CASH_MAIN, 'debit_amount' => 100],
+            ['account_code' => ChartAccountCodes::SALES_REVENUE, 'credit_amount' => 100],
+        ],
+        'بيع تجريبي',
+    );
+
+    expect($entry->lines)->toHaveCount(2);
+    expect($entry->isBalanced())->toBeTrue();
+});
+
+it('rejects unbalanced journal entries', function () {
+    $this->service->post(
+        $this->team,
+        [
+            ['account_code' => ChartAccountCodes::CASH_MAIN, 'debit_amount' => 100],
+            ['account_code' => ChartAccountCodes::SALES_REVENUE, 'credit_amount' => 50],
+        ],
+        'قيد غير متوازن',
+    );
+})->throws(InvalidArgumentException::class);
+
+it('finds account by code', function () {
+    $account = $this->service->getAccountByCode($this->team, ChartAccountCodes::CASH_MAIN);
+
+    expect($account)->toBeInstanceOf(Account::class);
+    expect($account->code)->toBe(ChartAccountCodes::CASH_MAIN);
+});
+
+it('validates balance without posting', function () {
+    expect(fn () => $this->service->validateBalance([
+        ['debit_amount' => 200, 'credit_amount' => 0],
+        ['debit_amount' => 0, 'credit_amount' => 200],
+    ]))->not->toThrow(InvalidArgumentException::class);
+
+    expect(fn () => $this->service->validateBalance([
+        ['debit_amount' => 100],
+        ['credit_amount' => 50],
+    ]))->toThrow(InvalidArgumentException::class);
+});
+
+it('voids a manual journal entry correctly and creates a reversal', function () {
+    $entry = $this->service->post(
+        $this->team,
+        [
+            ['account_code' => ChartAccountCodes::CASH_MAIN, 'debit_amount' => 100],
+            ['account_code' => ChartAccountCodes::SALES_REVENUE, 'credit_amount' => 100],
+        ],
+        'قيد يدوي',
+    );
+
+    $reversal = $this->service->voidEntry($entry);
+
+    expect($entry->fresh()->status)->toBe(\App\Enums\JournalEntryStatus::VOID);
+    expect($reversal->status)->toBe(\App\Enums\JournalEntryStatus::POSTED);
+    expect($reversal->reference_type)->toBe(\App\Models\JournalEntry::class);
+    expect($reversal->reference_id)->toBe($entry->id);
+
+    $debitLine = $reversal->lines->first(fn ($l) => $l->account->code === ChartAccountCodes::SALES_REVENUE);
+    $creditLine = $reversal->lines->first(fn ($l) => $l->account->code === ChartAccountCodes::CASH_MAIN);
+
+    expect((float) $debitLine->debit_amount)->toBe(100.00);
+    expect((float) $creditLine->credit_amount)->toBe(100.00);
+});
+
+it('prevents voiding already voided entries', function () {
+    $entry = $this->service->post(
+        $this->team,
+        [
+            ['account_code' => ChartAccountCodes::CASH_MAIN, 'debit_amount' => 100],
+            ['account_code' => ChartAccountCodes::SALES_REVENUE, 'credit_amount' => 100],
+        ],
+        'قيد يدوي',
+    );
+
+    $this->service->voidEntry($entry);
+
+    $this->expectException(InvalidArgumentException::class);
+    $this->expectExceptionMessage('القيد ملغي مسبقاً');
+
+    $this->service->voidEntry($entry);
+});
+
+it('prevents voiding a voiding/reversal entry', function () {
+    $entry = $this->service->post(
+        $this->team,
+        [
+            ['account_code' => ChartAccountCodes::CASH_MAIN, 'debit_amount' => 100],
+            ['account_code' => ChartAccountCodes::SALES_REVENUE, 'credit_amount' => 100],
+        ],
+        'قيد يدوي',
+    );
+
+    $reversal = $this->service->voidEntry($entry);
+
+    $this->expectException(InvalidArgumentException::class);
+    $this->expectExceptionMessage('لا يمكن إلغاء قيد إلغاء أو قيد عكسي.');
+
+    $this->service->voidEntry($reversal);
+});
+
+it('allows voiding a system-generated entry and creates a reversal', function () {
+    $entry = $this->service->post(
+        $this->team,
+        [
+            ['account_code' => ChartAccountCodes::CASH_MAIN, 'debit_amount' => 100],
+            ['account_code' => ChartAccountCodes::SALES_REVENUE, 'credit_amount' => 100],
+        ],
+        'قيد نظامي',
+        'App\Models\InventoryCount',
+        999
+    );
+
+    $reversal = $this->service->voidEntry($entry);
+
+    expect($entry->fresh()->status)->toBe(\App\Enums\JournalEntryStatus::VOID);
+    expect($reversal->status)->toBe(\App\Enums\JournalEntryStatus::POSTED);
+    expect($reversal->reference_type)->toBe(\App\Models\JournalEntry::class);
+    expect($reversal->reference_id)->toBe($entry->id);
+});

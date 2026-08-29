@@ -1,0 +1,410 @@
+<?php
+
+namespace App\Services;
+
+use App\Enums\MerchantPaymentAccountType;
+use App\Enums\SalePaymentType;
+use App\Enums\StockMovementType;
+use App\Models\MerchantCustomer;
+use App\Models\MerchantCustomerPayment;
+use App\Models\MerchantPaymentAccount;
+use App\Models\MerchantProduct;
+use App\Models\PosSale;
+use App\Models\PosSaleItem;
+use App\Models\Team;
+use App\Support\ChartAccountCodes;
+use App\Services\ChartOfAccountsSyncService;
+use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\DB;
+
+class PosSaleService
+{
+    public function __construct(
+        protected AccountingService $accountingService,
+        protected StockMovementService $stockMovementService,
+        protected ChartOfAccountsSyncService $chartSyncService,
+    ) {}
+
+    /**
+     * @param  array<int, array{merchant_product_id?: int|null, product_name: string, quantity: float, unit_price: float}>  $items
+     */
+    public function createSale(
+        Team $team,
+        array $items,
+        SalePaymentType $paymentType,
+        float $paidAmount = 0,
+        ?MerchantCustomer $customer = null,
+        ?string $paymentMethod = null,
+        ?string $notes = null,
+        ?int $merchantPaymentAccountId = null,
+        ?string $paymentReference = null,
+        float $customerCreditApplied = 0,
+    ): PosSale {
+        return DB::transaction(function () use ($team, $items, $paymentType, $paidAmount, $customer, $paymentMethod, $notes, $merchantPaymentAccountId, $paymentReference, $customerCreditApplied) {
+            if (in_array($paymentType, [SalePaymentType::CREDIT, SalePaymentType::PARTIAL], true) && ! $customer) {
+                throw new \InvalidArgumentException('يجب اختيار عميل مسجّل للبيع الآجل أو الجزئي');
+            }
+
+            $totalAmount = collect($items)->sum(fn ($item) => $item['quantity'] * $item['unit_price']);
+
+            if ($customerCreditApplied > 0) {
+                if (! $customer) {
+                    throw new \InvalidArgumentException('يجب اختيار عميل لاستخدام الرصيد الفائض');
+                }
+
+                if ($customerCreditApplied > (float) $customer->credit_balance) {
+                    throw new \InvalidArgumentException('الرصيد الفائض للعميل غير كافٍ');
+                }
+
+                if ($customerCreditApplied > $totalAmount) {
+                    throw new \InvalidArgumentException('لا يمكن خصم رصيد فائض أكبر من إجمالي الفاتورة');
+                }
+
+                $customer->decrement('credit_balance', $customerCreditApplied);
+            }
+
+            // التحقق من توافر المخزون لجميع المنتجات في قاعدة البيانات
+            foreach ($items as $item) {
+                if (! empty($item['merchant_product_id'])) {
+                    $product = MerchantProduct::find($item['merchant_product_id']);
+                    if ($product) {
+                        $requestedQty = (float) $item['quantity'];
+                        $availableQty = (float) $product->stock_quantity;
+                        if ($requestedQty > $availableQty) {
+                            throw new \InvalidArgumentException("الكمية المطلوبة للمنتج ({$product->name}) هي " . number_format($requestedQty, 2) . "، ولكن المتاح في المخزن هو " . number_format($availableQty, 2) . " فقط.");
+                        }
+                    }
+                }
+            }
+
+            $remainingTotal = $totalAmount - $customerCreditApplied;
+
+            $creditAmount = match ($paymentType) {
+                SalePaymentType::CASH => 0,
+                SalePaymentType::CREDIT => $remainingTotal,
+                SalePaymentType::PARTIAL => max(0, $remainingTotal - $paidAmount),
+            };
+
+            $actualPaid = match ($paymentType) {
+                SalePaymentType::CASH => $remainingTotal,
+                SalePaymentType::CREDIT => 0,
+                SalePaymentType::PARTIAL => $paidAmount,
+            };
+
+            $sale = PosSale::create([
+                'team_id' => $team->id,
+                'sale_number' => $this->generateSaleNumber($team),
+                'merchant_customer_id' => $customer?->id,
+                'total_amount' => $totalAmount,
+                'paid_amount' => $actualPaid,
+                'credit_amount' => $creditAmount,
+                'customer_credit_applied' => $customerCreditApplied,
+                'payment_type' => $paymentType,
+                'payment_method' => $paymentType === SalePaymentType::CREDIT ? null : $paymentMethod,
+                'merchant_payment_account_id' => $paymentType === SalePaymentType::CREDIT ? null : $merchantPaymentAccountId,
+                'payment_reference' => $paymentType === SalePaymentType::CREDIT ? null : $paymentReference,
+                'status' => 'completed',
+                'notes' => $notes,
+                'sold_by' => Auth::id(),
+            ]);
+
+            foreach ($items as $item) {
+                $saleItem = PosSaleItem::create([
+                    'pos_sale_id'        => $sale->id,
+                    'merchant_product_id' => $item['merchant_product_id'] ?? null,
+                    'product_name'       => $item['product_name'],
+                    'quantity'           => $item['quantity'],
+                    'unit_price'         => $item['unit_price'],
+                    'total'              => $item['quantity'] * $item['unit_price'],
+                ]);
+
+                if (! empty($item['merchant_product_id'])) {
+                    $product = MerchantProduct::find($item['merchant_product_id']);
+                    if ($product) {
+                        $this->stockMovementService->recordSale(
+                            $team, $product, (float) $item['quantity'], $sale
+                        );
+                    }
+                }
+            }
+
+            $this->postSaleJournalEntry($team, $sale, $customer);
+
+            return $sale->load('items');
+        });
+    }
+
+    public function recordCustomerPayment(
+        Team $team,
+        MerchantCustomer $customer,
+        float $amount,
+        string $paymentMethod = 'cash',
+        ?int $merchantPaymentAccountId = null,
+        ?string $referenceNumber = null,
+        ?string $notes = null,
+        ?int $receivedBy = null,
+        bool $prepaidOnly = false,
+    ): MerchantCustomerPayment {
+        if ($amount <= 0) {
+            throw new \InvalidArgumentException('مبلغ السداد يجب أن يكون أكبر من صفر');
+        }
+
+        return DB::transaction(function () use ($team, $customer, $amount, $paymentMethod, $merchantPaymentAccountId, $referenceNumber, $notes, $receivedBy, $prepaidOnly) {
+            $debt = (float) $customer->balance;
+            $appliedToBalance = $prepaidOnly ? 0 : min($amount, $debt);
+            $surplusToCredit = $amount - $appliedToBalance;
+
+            $payment = MerchantCustomerPayment::create([
+                'team_id' => $team->id,
+                'merchant_customer_id' => $customer->id,
+                'merchant_payment_account_id' => $merchantPaymentAccountId,
+                'payment_method' => $paymentMethod,
+                'amount' => $amount,
+                'applied_to_balance' => $appliedToBalance,
+                'surplus_to_credit' => $surplusToCredit,
+                'reference_number' => $referenceNumber,
+                'notes' => $notes,
+                'received_by' => $receivedBy ?? Auth::id(),
+            ]);
+
+            $description = 'تحصيل من العميل';
+            if ($referenceNumber) {
+                $description .= ' — مرجع: '.$referenceNumber;
+            }
+
+            $lines = [
+                array_merge(
+                    [
+                        'debit_amount' => $amount,
+                        'description' => $description,
+                    ],
+                    $this->debitAccountReference(
+                        $team,
+                        $paymentMethod,
+                        $merchantPaymentAccountId,
+                    ),
+                ),
+            ];
+
+            if ($appliedToBalance > 0) {
+                $lines[] = [
+                    'account_code' => $this->chartSyncService->accountCodeForCustomer($customer),
+                    'credit_amount' => $appliedToBalance,
+                    'description' => 'سداد ذمم العميل',
+                    'subledger_type' => MerchantCustomer::class,
+                    'subledger_id' => $customer->id,
+                ];
+            }
+
+            if ($surplusToCredit > 0) {
+                $lines[] = [
+                    'account_code' => ChartAccountCodes::CUSTOMER_PREPAID,
+                    'credit_amount' => $surplusToCredit,
+                    'description' => 'رصيد فائض للعميل (دفعة مقدمة)',
+                    'subledger_type' => MerchantCustomer::class,
+                    'subledger_id' => $customer->id,
+                ];
+            }
+
+            $this->accountingService->post(
+                $team,
+                $lines,
+                'سداد عميل: '.$customer->name,
+                MerchantCustomerPayment::class,
+                $payment->id,
+            );
+
+            if ($appliedToBalance > 0) {
+                $customer->decrement('balance', $appliedToBalance);
+            }
+
+            if ($surplusToCredit > 0) {
+                $customer->increment('credit_balance', $surplusToCredit);
+            }
+
+            return $payment;
+        });
+    }
+
+    protected function postSaleJournalEntry(Team $team, PosSale $sale, ?MerchantCustomer $customer): void
+    {
+        $lines = [];
+        $customerCreditApplied = (float) $sale->customer_credit_applied;
+
+        if ($customerCreditApplied > 0 && $customer) {
+            $lines[] = [
+                'account_code' => ChartAccountCodes::CUSTOMER_PREPAID,
+                'debit_amount' => $customerCreditApplied,
+                'description' => 'استخدام رصيد عميل مسبق',
+                'subledger_type' => MerchantCustomer::class,
+                'subledger_id' => $customer->id,
+            ];
+        }
+
+        $revenueLine = [
+            'account_code' => ChartAccountCodes::SALES_REVENUE,
+            'credit_amount' => (float) $sale->total_amount,
+            'description' => 'إيرادات مبيعات',
+        ];
+
+        if ($sale->payment_type === SalePaymentType::CASH) {
+            if ($sale->paid_amount > 0) {
+                $lines[] = array_merge(
+                    [
+                        'debit_amount' => (float) $sale->paid_amount,
+                        'description' => $this->paymentDescription($sale),
+                    ],
+                    $this->debitAccountReference(
+                        $team,
+                        $sale->payment_method,
+                        $sale->merchant_payment_account_id,
+                    ),
+                );
+            }
+            $lines[] = $revenueLine;
+            $totalDebit = collect($lines)->sum(fn ($l) => (float) ($l['debit_amount'] ?? 0));
+            if ($totalDebit <= 0) {
+                return;
+            }
+        } elseif ($sale->payment_type === SalePaymentType::CREDIT) {
+            if ($sale->credit_amount > 0) {
+                $lines[] = [
+                    'account_code' => $this->chartSyncService->accountCodeForCustomer($customer),
+                    'debit_amount' => (float) $sale->credit_amount,
+                    'description' => 'ذمم مدينة',
+                    'subledger_type' => $customer ? MerchantCustomer::class : null,
+                    'subledger_id' => $customer?->id,
+                ];
+
+                if ($customer) {
+                    $customer->increment('balance', (float) $sale->credit_amount);
+                }
+            }
+            $lines[] = $revenueLine;
+        } else {
+            if ($sale->paid_amount > 0) {
+                $lines[] = array_merge(
+                    [
+                        'debit_amount' => (float) $sale->paid_amount,
+                        'description' => $this->paymentDescription($sale, partial: true),
+                    ],
+                    $this->debitAccountReference(
+                        $team,
+                        $sale->payment_method,
+                        $sale->merchant_payment_account_id,
+                    ),
+                );
+            }
+            if ($sale->credit_amount > 0) {
+                $lines[] = [
+                    'account_code' => $this->chartSyncService->accountCodeForCustomer($customer),
+                    'debit_amount' => (float) $sale->credit_amount,
+                    'description' => 'ذمم مدينة جزئية',
+                    'subledger_type' => $customer ? MerchantCustomer::class : null,
+                    'subledger_id' => $customer?->id,
+                ];
+
+                if ($customer) {
+                    $customer->increment('balance', (float) $sale->credit_amount);
+                }
+            }
+            $lines[] = $revenueLine;
+        }
+
+        $this->accountingService->post(
+            $team,
+            $lines,
+            'بيع رقم '.$sale->sale_number,
+            PosSale::class,
+            $sale->id,
+        );
+
+        // قيد تكلفة البضائع المباعة (COGS) — النظام المستمر
+        $totalCost = $sale->items->sum(function ($item) {
+            if (! $item->merchant_product_id) {
+                return 0;
+            }
+            $product = MerchantProduct::find($item->merchant_product_id);
+            return $product ? (float) $product->cost * (float) $item->quantity : 0;
+        });
+
+        if ($totalCost > 0) {
+            $this->accountingService->post(
+                $team,
+                [
+                    ['account_code' => ChartAccountCodes::COGS, 'debit_amount'  => $totalCost, 'description' => 'تكلفة البضائع المباعة — بيع '.$sale->sale_number],
+                    ['account_code' => ChartAccountCodes::INVENTORY, 'credit_amount' => $totalCost, 'description' => 'صرف مخزون — بيع '.$sale->sale_number],
+                ],
+                'تكلفة بضائع مباعة — بيع '.$sale->sale_number,
+                PosSale::class,
+                $sale->id,
+            );
+        }
+    }
+
+    /**
+     * @return array{account_code: string}|array{account_id: int}
+     */
+    protected function debitAccountReference(
+        Team $team,
+        ?string $paymentMethod,
+        ?int $merchantPaymentAccountId,
+    ): array {
+        if ($merchantPaymentAccountId) {
+            $paymentAccount = MerchantPaymentAccount::find($merchantPaymentAccountId);
+
+            if ($paymentAccount) {
+                $account = $this->chartSyncService->syncPaymentAccount($paymentAccount);
+
+                if ($account) {
+                    return ['account_id' => $account->id];
+                }
+            }
+        }
+
+        return [
+            'account_code' => match ($paymentMethod) {
+                'bank_transfer' => $this->defaultPaymentAccountCode($team, MerchantPaymentAccountType::BANK),
+                'card' => $this->defaultPaymentAccountCode($team, MerchantPaymentAccountType::CARD),
+                default => ChartAccountCodes::CASH_MAIN,
+            },
+        ];
+    }
+
+    protected function defaultPaymentAccountCode(Team $team, MerchantPaymentAccountType $type): string
+    {
+        $paymentAccount = MerchantPaymentAccount::where('team_id', $team->id)
+            ->where('type', $type)
+            ->orderByDesc('is_default')
+            ->first();
+
+        if ($paymentAccount) {
+            return $this->chartSyncService->accountCodeForPaymentAccount($paymentAccount, $team);
+        }
+
+        return ChartAccountCodes::CASH_MAIN;
+    }
+
+    protected function paymentDescription(PosSale $sale, bool $partial = false): string
+    {
+        $label = match ($sale->payment_method) {
+            'bank_transfer' => $partial ? 'تحويل بنكي جزئي' : 'تحويل بنكي',
+            'card' => $partial ? 'بطاقة جزئية' : 'بطاقة',
+            default => $partial ? 'نقدية جزئية' : 'نقدية',
+        };
+
+        if ($sale->payment_reference) {
+            $label .= ' — مرجع: '.$sale->payment_reference;
+        }
+
+        return $label;
+    }
+
+    protected function generateSaleNumber(Team $team): string
+    {
+        $lastSale = PosSale::where('team_id', $team->id)->orderByDesc('id')->first();
+        $nextNumber = $lastSale ? ((int) $lastSale->sale_number) + 1 : 1;
+
+        return str_pad((string) $nextNumber, 7, '0', STR_PAD_LEFT);
+    }
+}

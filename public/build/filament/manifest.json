@@ -1,0 +1,20 @@
+{
+  "resources/css/filament/admin/theme.css": {
+    "file": "assets/theme-CoTAma_n.css",
+    "name": "theme",
+    "names": [
+      "theme.css"
+    ],
+    "src": "resources/css/filament/admin/theme.css",
+    "isEntry": true
+  },
+  "resources/css/shepherd-tour.css": {
+    "file": "assets/shepherd-tour-Cpg8Y2kb.css",
+    "name": "shepherd-tour",
+    "names": [
+      "shepherd-tour.css"
+    ],
+    "src": "resources/css/shepherd-tour.css",
+    "isEntry": true
+  }
+}

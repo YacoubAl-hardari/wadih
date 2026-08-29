@@ -1,0 +1,43 @@
+{
+  "resources/js/src/fonts/GraphikArabic-Black.woff": {
+    "file": "assets/GraphikArabic-Black-DXblm6rt.woff",
+    "src": "resources/js/src/fonts/GraphikArabic-Black.woff"
+  },
+  "resources/js/src/fonts/GraphikArabic-Bold.woff": {
+    "file": "assets/GraphikArabic-Bold-OTckoL3O.woff",
+    "src": "resources/js/src/fonts/GraphikArabic-Bold.woff"
+  },
+  "resources/js/src/fonts/GraphikArabic-Medium.woff": {
+    "file": "assets/GraphikArabic-Medium-BkY9_YK4.woff",
+    "src": "resources/js/src/fonts/GraphikArabic-Medium.woff"
+  },
+  "resources/js/src/fonts/GraphikArabic-Regular.woff": {
+    "file": "assets/GraphikArabic-Regular-D3gNBhTy.woff",
+    "src": "resources/js/src/fonts/GraphikArabic-Regular.woff"
+  },
+  "resources/js/src/fonts/GraphikArabic-Semibold.woff": {
+    "file": "assets/GraphikArabic-Semibold-Bz6Uhk_x.woff",
+    "src": "resources/js/src/fonts/GraphikArabic-Semibold.woff"
+  },
+  "resources/js/src/fonts/GraphikArabic-Super.woff": {
+    "file": "assets/GraphikArabic-Super-Bz2ypzM4.woff",
+    "src": "resources/js/src/fonts/GraphikArabic-Super.woff"
+  },
+  "resources/js/src/main.tsx": {
+    "file": "assets/main-Bt7FzLxz.js",
+    "name": "main",
+    "src": "resources/js/src/main.tsx",
+    "isEntry": true,
+    "css": [
+      "assets/main-DO2GnUsP.css"
+    ],
+    "assets": [
+      "assets/GraphikArabic-Regular-D3gNBhTy.woff",
+      "assets/GraphikArabic-Medium-BkY9_YK4.woff",
+      "assets/GraphikArabic-Semibold-Bz6Uhk_x.woff",
+      "assets/GraphikArabic-Bold-OTckoL3O.woff",
+      "assets/GraphikArabic-Black-DXblm6rt.woff",
+      "assets/GraphikArabic-Super-Bz2ypzM4.woff"
+    ]
+  }
+}

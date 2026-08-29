@@ -1,0 +1,92 @@
+<?php
+
+namespace App\Filament\Resources\UserMerchantWallets;
+
+use App\Enums\UserType;
+use App\Filament\Concerns\HasRoleAccess;
+use App\Filament\Resources\UserMerchantWallets\Pages\CreateUserMerchantWallet;
+use App\Filament\Resources\UserMerchantWallets\Pages\EditUserMerchantWallet;
+use App\Filament\Resources\UserMerchantWallets\Pages\ListUserMerchantWallets;
+use App\Filament\Resources\UserMerchantWallets\Pages\ViewUserMerchantWallet;
+use App\Filament\Resources\UserMerchantWallets\Schemas\UserMerchantWalletForm;
+use App\Filament\Resources\UserMerchantWallets\Schemas\UserMerchantWalletInfolist;
+use App\Filament\Resources\UserMerchantWallets\Tables\UserMerchantWalletsTable;
+use App\Models\UserMerchantWallet;
+use BackedEnum;
+use Filament\Resources\Resource;
+use Filament\Schemas\Schema;
+use Filament\Support\Icons\Heroicon;
+use Filament\Tables\Table;
+
+class UserMerchantWalletResource extends Resource
+{
+    use HasRoleAccess;
+
+    protected static ?string $model = UserMerchantWallet::class;
+
+    protected static function allowedRoles(): array
+    {
+        return [UserType::USER, UserType::ADMIN];
+    }
+
+    protected static string|BackedEnum|null $navigationIcon = Heroicon::OutlinedCreditCard;
+
+    protected static ?string $recordTitleAttribute = 'account_name';
+
+    public static function getNavigationParentItem(): ?string
+{
+   return "التجار";
+}
+
+public static function getNavigationSort(): ?int
+{
+   return 2;
+}
+
+public static function getModelLabel(): string
+{
+   return "محافظ التجار";
+}
+public static function getNavigationLabel(): string
+{
+   return "محافظ التجار";
+}
+
+public static function getPluralModelLabel(): string
+{
+   return "محافظ التجار";
+}
+
+
+    public static function form(Schema $schema): Schema
+    {
+        return UserMerchantWalletForm::configure($schema);
+    }
+
+    public static function infolist(Schema $schema): Schema
+    {
+        return UserMerchantWalletInfolist::configure($schema);
+    }
+
+    public static function table(Table $table): Table
+    {
+        return UserMerchantWalletsTable::configure($table);
+    }
+
+    public static function getRelations(): array
+    {
+        return [
+            //
+        ];
+    }
+
+    public static function getPages(): array
+    {
+        return [
+            'index' => ListUserMerchantWallets::route('/'),
+            // 'create' => CreateUserMerchantWallet::route('/create'),
+            // 'view' => ViewUserMerchantWallet::route('/{record}'),
+            // 'edit' => EditUserMerchantWallet::route('/{record}/edit'),
+        ];
+    }
+}
